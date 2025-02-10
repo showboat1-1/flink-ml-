@@ -1,6 +1,7 @@
 package cn.swust.algorithms.apriori;
 
 import org.apache.commons.collections.IteratorUtils;
+import org.apache.flink.ml.param.Param;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.api.Table;
@@ -14,6 +15,7 @@ import org.junit.Test;
 import java.io.File;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.Assert.*;
 
@@ -154,12 +156,14 @@ public class AprioriTest extends AbstractTestBase {
                         .setMinSupport(0.3)
                         .setMinConfidence(0.4)
                         .setLift(1.2)
-                        .setItemSeparator("/");
+                        .setItemSeparator("/")
+                        .setInputCols("items");
 
         assertEquals(0.3, apriori.getMinSupport(), 0.0001);
         assertEquals(0.4, apriori.getMinConfidence(), 0.0001);
         assertEquals(1.2, apriori.getLift(), 0.0001);
         assertEquals("/", apriori.getItemSeparator());
+        assertEquals("items", apriori.getInputCols()[0]);
     }
 
     @Test
@@ -169,7 +173,8 @@ public class AprioriTest extends AbstractTestBase {
                         .setMinSupport(0.3)
                         .setMinConfidence(0.4)
                         .setLift(1.2)
-                        .setItemSeparator("/");
+                        .setItemSeparator("/")
+                        .setInputCols("items");
 
         Table output = apriori.transform(inputDataTable)[0];
 

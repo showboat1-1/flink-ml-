@@ -35,10 +35,9 @@ public class Apriori implements AprioriParams<Apriori>, AlgoOperator<Apriori> {
 
     @Override
     public Table[] transform(Table... inputs) {
-
         Preconditions.checkArgument(inputs.length == 1);
-
         Preconditions.checkNotNull(getItemSeparator(), "itemSeparator must not be null");
+        Preconditions.checkArgument(getInputCols().length==1, "inputCols must be one");
 
 
         StreamTableEnvironment tEnv =
@@ -47,7 +46,7 @@ public class Apriori implements AprioriParams<Apriori>, AlgoOperator<Apriori> {
         //生成数据记录流,仅关心记录条数
         SingleOutputStreamOperator<Tuple2<List<String>, Integer>> tmpMapData = tEnv
                 .toDataStream(inputs[0])
-                .map(row -> Tuple2.of(Arrays.asList((String) row.getField(0)), 1),
+                .map(row -> Tuple2.of(Arrays.asList((String) row.getField(getInputCols()[0])), 1),
                         Types.TUPLE(Types.LIST(Types.STRING), Types.INT));
 
         DataStream<Tuple2<List<String>, Integer>> recordData = DataStreamUtils.reduce(
@@ -146,10 +145,28 @@ public class Apriori implements AprioriParams<Apriori>, AlgoOperator<Apriori> {
                                             },
                                             Types.TUPLE(Types.LIST(Types.STRING), Types.INT, Types.DOUBLE, Types.DOUBLE, Types.DOUBLE, Types.LIST(Types.STRING), Types.LIST(Types.STRING)));
 
+                    //构建自定义迭代终止条件，当反馈流数据条数为0时终止
+                    /*SingleOutputStreamOperator<Tuple7<List<String>, Integer, Double, Double, Double, List<String>, List<String>>> terminalData = tmpData.filter(r -> r.f4 == 0.0);
+                    terminalData.map(r->{
+                        System.out.println(r);
+                        return r;
+                    }, Types.TUPLE(Types.LIST(Types.STRING), Types.INT, Types.DOUBLE, Types.DOUBLE, Types.DOUBLE, Types.LIST(Types.STRING), Types.LIST(Types.STRING)));
+                    final String broadcastTerKey = "broadcastTerKey";
+                    DataStream<Integer> terminalStream = BroadcastUtils.withBroadcastStream(
+                            Collections.singletonList(newData),
+                            Collections.singletonMap(broadcastTerKey, terminalData),
+                            inputList -> {
+                                DataStream input = inputList.get(0);
+                                return input.flatMap(
+                                        new TerminalUDF(broadcastVarKey, getMaxIter()));
+                            }
+                    );*/
+                    SingleOutputStreamOperator<Integer> terminalStream = feedback.flatMap(new TerminateOnMaxIter<>(getMaxIter()));
+
                     return new IterationBodyResult(
                             DataStreamList.of(newData),//feedStream
                             DataStreamList.of(newData),//outputStream
-                            variable.flatMap(new TerminateOnMaxIter(getMaxIter())));//terminateStream 默认迭代20轮
+                            terminalStream);//terminateStream 默认迭代20轮
                 });//返回一个只读列表
 
         DataStream<Tuple7<List<String>, Integer, Double, Double, Double, List<String>, List<String>>> outputData1 = outputDataList1.get(0);
@@ -168,6 +185,46 @@ public class Apriori implements AprioriParams<Apriori>, AlgoOperator<Apriori> {
 
         //流转表
         return new Table[]{convertToTable(tEnv, tt)};
+    }
+
+    private class TerminalUDF
+            extends RichFlatMapFunction<Tuple7<List<String>, Integer, Double, Double, Double, List<String>, List<String>>, Integer>
+            implements IterationListener<Integer>{
+        private List<Tuple7<List<String>, Integer, Double, Double, Double, List<String>, List<String>>> perRecords;
+        private final String broadcastTerKey;
+        private final int maxIter;
+
+        private TerminalUDF(String broadcastTerKey, int maxIter) {
+            this.broadcastTerKey = broadcastTerKey;
+            this.maxIter = maxIter;
+        }
+
+        @Override
+        public void flatMap(Tuple7<List<String>, Integer, Double, Double, Double, List<String>, List<String>> value, Collector<Integer> out) throws Exception {
+            if (perRecords == null) {
+                try {
+                    System.out.println("perRecords is null");
+                    perRecords = getRuntimeContext().getBroadcastVariable(broadcastTerKey);
+                }catch (NullPointerException e){
+                    System.out.println("terminalData is null");
+                    perRecords = null;
+                }
+            }
+        }
+
+        @Override
+        public void onEpochWatermarkIncremented(int i, Context context, Collector<Integer> collector) throws Exception {
+            System.out.println("i "+ i);
+            if (i + 1 < maxIter && perRecords != null) {
+                collector.collect(0);
+            }
+
+        }
+
+        @Override
+        public void onIterationTerminated(Context context, Collector<Integer> collector) throws Exception {
+
+        }
     }
 
     private Table convertToTable(StreamTableEnvironment tEnv, DataStream<Tuple7<List<String>, Integer, Double, Double, Double, List<String>, List<String>>> inputDataStream){
@@ -290,7 +347,7 @@ public class Apriori implements AprioriParams<Apriori>, AlgoOperator<Apriori> {
     private class CalCombinationConditions implements FlatMapFunction<Row, Tuple2<List<String>, Integer>> {
         @Override
         public void flatMap(Row value, Collector<Tuple2<List<String>, Integer>> out) throws Exception {
-            String line = (String) value.getField(0);
+            String line = (String) value.getField(getInputCols()[0]);
             //按照 给定 分隔符 进行 分割
             String[] strs = line.split(getItemSeparator());
             int len = strs.length;
@@ -362,3 +419,88 @@ public class Apriori implements AprioriParams<Apriori>, AlgoOperator<Apriori> {
         return comb;
     }
 }
+/**
+ * 方案一 使用 全轮 存在的运算符
+ */
+//        //进行迭代求解 每轮不创建新的运算符
+//        DataStreamList outputDataList = Iterations.iterateBoundedStreamsUntilTermination(
+//                DataStreamList.of(varData),
+//                ReplayableDataStreamList.replay(replayData),
+//                IterationConfig.newBuilder().build(),//默认运算符只创建一次，在整个迭代过程中将不再创建
+//                (variableStreams, dataStreams) -> {
+//                    //把可变流广播到每一个并行任务上
+//                    final String broadcastVarKey = "broadcastVarKey";
+//                    DataStream<Tuple7<String, Integer, Double, Double, Double, String, String>> variable = variableStreams.get(0);
+//                    DataStream<Tuple7<String, Integer, Double, Double, Double, String, String>> replayed = dataStreams.get(0);
+//
+//                    //设置迭代轮数 默认20轮
+//                    DataStream<Integer> terminateStream =
+//                            variable
+//                                    .flatMap(
+//                                            new TerminateOnMaxIter(5));
+//
+//                    //查看每一轮可变流的改变
+//                    variable.map(r -> {
+//                        System.out.println(r);
+//                        return r;
+//                    }, Types.TUPLE(Types.STRING, Types.INT, Types.DOUBLE, Types.DOUBLE, Types.DOUBLE));
+//
+//                    //计算置信度和提升度
+//                    DataStream<Tuple7<String, Integer, Double, Double, Double, String, String>> tmpData = BroadcastUtils.withBroadcastStream(
+//                            Collections.singletonList(replayed),
+//                            Collections.singletonMap(broadcastVarKey, variable),
+//                            inputList -> {
+//                                DataStream input = inputList.get(0);
+//                                return input.flatMap(
+//                                        new CalConfidenceAndLift(broadcastVarKey),
+//                                        Types.TUPLE(Types.STRING, Types.INT, Types.DOUBLE, Types.DOUBLE, Types.DOUBLE, Types.STRING, Types.STRING));
+//                            }
+//                    );
+//                    //利用map消除addTail报错
+//                    SingleOutputStreamOperator<Tuple7<String, Integer, Double, Double, Double, String, String>> newData =
+//                            tmpData
+//                                    .map(
+//                                            r -> {
+////                                                System.out.println(r);
+//                                                return r;
+//                                            },
+//                                            Types.TUPLE(Types.STRING, Types.INT, Types.DOUBLE, Types.DOUBLE, Types.DOUBLE, Types.STRING, Types.STRING));
+//
+//
+//                    //仅将最后一轮迭代的结果返回输出
+//                    DataStream<Tuple7<String, Integer, Double, Double, Double, String, String>> finalData =
+//                            tmpData
+//                                    .flatMap(
+//                                            new ForwardInputsOfLastRound<>());
+//
+//                    finalData.map(r->{
+//                        System.out.println(r);
+//                        return r;
+//                    },Types.TUPLE(Types.STRING, Types.INT, Types.DOUBLE, Types.DOUBLE, Types.DOUBLE, Types.STRING, Types.STRING));
+////                    System.out.println(tmpData.getTransformation().getInputs().size());
+////                    System.out.println(tmpData.getTransformation() instanceof PhysicalTransformation);
+////                    System.out.println(newData.getTransformation().getInputs().size());
+////                    System.out.println(newData.getTransformation() instanceof PhysicalTransformation);
+//
+//                    return new IterationBodyResult(
+//                            DataStreamList.of(newData),//feedStream
+//                            DataStreamList.of(finalData),//outputStream
+//                            terminateStream);//terminateStream
+//                });//返回一个只读列表
+
+//        DataStream<Tuple7<String, Integer, Double, Double, Double, String, String>> outputData = outputDataList.get(0);
+//        outputData.print();
+
+//        SingleOutputStreamOperator<Tuple7<String, Integer, Double, Double, Double, String, String>> endData = outputData.connect(varData).process(new CoProcessFunction<Tuple7<String, Integer, Double, Double, Double, String, String>, Tuple7<String, Integer, Double, Double, Double, String, String>, Tuple7<String, Integer, Double, Double, Double, String, String>>() {
+//            @Override
+//            public void processElement1(Tuple7<String, Integer, Double, Double, Double, String, String> value, CoProcessFunction<Tuple7<String, Integer, Double, Double, Double, String, String>, Tuple7<String, Integer, Double, Double, Double, String, String>, Tuple7<String, Integer, Double, Double, Double, String, String>>.Context ctx, Collector<Tuple7<String, Integer, Double, Double, Double, String, String>> out) throws Exception {
+//                out.collect(value);
+//            }
+//
+//            @Override
+//            public void processElement2(Tuple7<String, Integer, Double, Double, Double, String, String> value, CoProcessFunction<Tuple7<String, Integer, Double, Double, Double, String, String>, Tuple7<String, Integer, Double, Double, Double, String, String>, Tuple7<String, Integer, Double, Double, Double, String, String>>.Context ctx, Collector<Tuple7<String, Integer, Double, Double, Double, String, String>> out) throws Exception {
+//                out.collect(value);
+//            }
+//        });
+//
+//        endData.print();

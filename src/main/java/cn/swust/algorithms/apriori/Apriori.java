@@ -4,6 +4,7 @@ import cn.hutool.core.collection.CollectionUtil;
 import org.apache.flink.api.common.functions.*;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.java.tuple.*;
+import org.apache.flink.api.java.typeutils.RowTypeInfo;
 import org.apache.flink.iteration.*;
 import org.apache.flink.ml.api.AlgoOperator;
 import org.apache.flink.ml.common.broadcast.BroadcastUtils;
@@ -144,23 +145,6 @@ public class Apriori implements AprioriParams<Apriori>, AlgoOperator<Apriori> {
                                                 return r;
                                             },
                                             Types.TUPLE(Types.LIST(Types.STRING), Types.INT, Types.DOUBLE, Types.DOUBLE, Types.DOUBLE, Types.LIST(Types.STRING), Types.LIST(Types.STRING)));
-
-                    //构建自定义迭代终止条件，当反馈流数据条数为0时终止
-                    /*SingleOutputStreamOperator<Tuple7<List<String>, Integer, Double, Double, Double, List<String>, List<String>>> terminalData = tmpData.filter(r -> r.f4 == 0.0);
-                    terminalData.map(r->{
-                        System.out.println(r);
-                        return r;
-                    }, Types.TUPLE(Types.LIST(Types.STRING), Types.INT, Types.DOUBLE, Types.DOUBLE, Types.DOUBLE, Types.LIST(Types.STRING), Types.LIST(Types.STRING)));
-                    final String broadcastTerKey = "broadcastTerKey";
-                    DataStream<Integer> terminalStream = BroadcastUtils.withBroadcastStream(
-                            Collections.singletonList(newData),
-                            Collections.singletonMap(broadcastTerKey, terminalData),
-                            inputList -> {
-                                DataStream input = inputList.get(0);
-                                return input.flatMap(
-                                        new TerminalUDF(broadcastVarKey, getMaxIter()));
-                            }
-                    );*/
                     SingleOutputStreamOperator<Integer> terminalStream = feedback.flatMap(new TerminateOnMaxIter<>(getMaxIter()));
 
                     return new IterationBodyResult(
@@ -187,49 +171,13 @@ public class Apriori implements AprioriParams<Apriori>, AlgoOperator<Apriori> {
         return new Table[]{convertToTable(tEnv, tt)};
     }
 
-    private class TerminalUDF
-            extends RichFlatMapFunction<Tuple7<List<String>, Integer, Double, Double, Double, List<String>, List<String>>, Integer>
-            implements IterationListener<Integer>{
-        private List<Tuple7<List<String>, Integer, Double, Double, Double, List<String>, List<String>>> perRecords;
-        private final String broadcastTerKey;
-        private final int maxIter;
-
-        private TerminalUDF(String broadcastTerKey, int maxIter) {
-            this.broadcastTerKey = broadcastTerKey;
-            this.maxIter = maxIter;
-        }
-
-        @Override
-        public void flatMap(Tuple7<List<String>, Integer, Double, Double, Double, List<String>, List<String>> value, Collector<Integer> out) throws Exception {
-            if (perRecords == null) {
-                try {
-                    System.out.println("perRecords is null");
-                    perRecords = getRuntimeContext().getBroadcastVariable(broadcastTerKey);
-                }catch (NullPointerException e){
-                    System.out.println("terminalData is null");
-                    perRecords = null;
-                }
-            }
-        }
-
-        @Override
-        public void onEpochWatermarkIncremented(int i, Context context, Collector<Integer> collector) throws Exception {
-            System.out.println("i "+ i);
-            if (i + 1 < maxIter && perRecords != null) {
-                collector.collect(0);
-            }
-
-        }
-
-        @Override
-        public void onIterationTerminated(Context context, Collector<Integer> collector) throws Exception {
-
-        }
-    }
-
     private Table convertToTable(StreamTableEnvironment tEnv, DataStream<Tuple7<List<String>, Integer, Double, Double, Double, List<String>, List<String>>> inputDataStream){
         //过滤出满足条件的数据
         // 7个字段 保存 频繁项集、出现次数、前缀、后缀、支持度、置信度、提升度
+        String[] fieldNames = {"itemSet", "count", "support", "confidence", "lift", "prefix", "suffix"};
+        RowTypeInfo inputTypeInfo = new RowTypeInfo(Types.LIST(Types.STRING), Types.INT, Types.DOUBLE, Types.DOUBLE, Types.DOUBLE, Types.LIST(Types.STRING), Types.LIST(Types.STRING));
+        RowTypeInfo outputTypeInfo = new RowTypeInfo(inputTypeInfo.getFieldTypes(), fieldNames);
+
         SingleOutputStreamOperator<Row> outputData = inputDataStream.filter(r->r.f3>=getMinConfidence()&&r.f4>=getLift()).map(r -> {
             int len = r.getArity();
             Row row = new Row(len);
@@ -237,11 +185,8 @@ public class Apriori implements AprioriParams<Apriori>, AlgoOperator<Apriori> {
                 row.setField(i, r.getField(i));
             }
             return row;
-        }).returns(Types.ROW(Types.LIST(Types.STRING), Types.INT, Types.DOUBLE, Types.DOUBLE, Types.DOUBLE, Types.LIST(Types.STRING), Types.LIST(Types.STRING)));
-
-        return tEnv
-                .fromDataStream(outputData)
-                .as("itemSet","count"," support", "confidence", "lift", "prefix", "suffix");
+        },outputTypeInfo);
+        return tEnv.fromDataStream(outputData);
     }
 
     @Override

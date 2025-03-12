@@ -291,7 +291,7 @@ public class Canopy implements CanopyParams<Canopy>, AlgoOperator<Canopy> {
                             OperatorStateUtils.getUniqueElement(nextCentriods, "nextCentriods")
                                     .orElse(null));
             //未到达迭代终点
-            System.out.println("i "+i);
+//            System.out.println("i "+i);
             if (i+1<maxIter && endPoint.hashCode() != cen.hashCode()){
                 collector.collect(0);
             }

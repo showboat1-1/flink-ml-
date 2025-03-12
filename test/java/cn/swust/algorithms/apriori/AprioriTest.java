@@ -1,6 +1,8 @@
 package cn.swust.algorithms.apriori;
 
 import org.apache.commons.collections.IteratorUtils;
+import org.apache.flink.api.java.typeutils.RowTypeInfo;
+import org.apache.flink.ml.common.datastream.TableUtils;
 import org.apache.flink.ml.param.Param;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -179,7 +181,7 @@ public class AprioriTest extends AbstractTestBase {
         Table output = apriori.transform(inputDataTable)[0];
 
         assertEquals(
-                Arrays.asList("itemSet","count"," support", "confidence", "lift", "prefix", "suffix"),
+                Arrays.asList("itemSet","count","support", "confidence", "lift", "prefix", "suffix"),
                 output.getResolvedSchema().getColumnNames());
     }
 
@@ -191,22 +193,19 @@ public class AprioriTest extends AbstractTestBase {
                         .setMinConfidence(0.4)
                         .setLift(1.2)
                         .setItemSeparator("/")
-                        .setInputCols("items")
-                        .setOutputCols("itemSet","count"," support", "confidence", "lift", "prefix", "suffix");
+                        .setInputCols("items");
 
         String path = "target/apriori_data_items_model";
-        if (new File(path).exists()) {
-            return;
+        if (!new File(path).exists()) {
+            apriori.save(path);
         }
-        apriori.save(path);
-
         Apriori loadedApriori = Apriori.load(tEnv, path);
         // 验证加载的参数
         assertEquals(apriori.getInputCols(), loadedApriori.getInputCols());
-        assertEquals(apriori.getOutputCols(), loadedApriori.getOutputCols());
 
         Table resultTable = loadedApriori.transform(inputDataTable)[0];
+        RowTypeInfo rowTypeInfo = TableUtils.getRowTypeInfo(resultTable.getResolvedSchema());
 
-        verifyOutputResult(resultTable,loadedApriori.getOutputCols());
+        verifyOutputResult(resultTable,rowTypeInfo.getFieldNames());
     }
 }

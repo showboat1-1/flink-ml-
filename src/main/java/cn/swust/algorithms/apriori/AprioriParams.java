@@ -5,7 +5,7 @@ import org.apache.flink.ml.common.param.HasMaxIter;
 import org.apache.flink.ml.common.param.HasOutputCols;
 import org.apache.flink.ml.param.*;
 
-public interface AprioriParams<T> extends HasInputCols<T>,HasOutputCols<T> , HasMaxIter<T> {
+public interface AprioriParams<T> extends HasInputCols<T>, HasMaxIter<T> {
     Param<Double> MIN_SUPPORT =
             new DoubleParam(
                     "minSupport",

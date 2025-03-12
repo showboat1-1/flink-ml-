@@ -21,7 +21,7 @@ import java.util.List;
 public class CanopyExample {
     public static void main(String[] args) throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-//        env.setParallelism(3);  // 设置全局并行度为 1
+        env.setParallelism(3);  // 设置全局并行度为 1
         StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
 
         List<DenseVector> testData = getTestData();

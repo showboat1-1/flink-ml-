@@ -2,6 +2,7 @@ package cn.swust.example;
 
 import cn.swust.algorithms.apriori.Apriori;
 import org.apache.commons.collections.IteratorUtils;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.ml.common.datastream.TableUtils;
 import org.apache.flink.streaming.api.datastream.*;
@@ -25,7 +26,7 @@ public class AprioriExample {
         //创建流环境
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         //设置并行度1
-        env.setParallelism(1);
+        env.setParallelism(3);
 
         //读取数据源
         List<Row> testData = getTestData();
@@ -49,7 +50,7 @@ public class AprioriExample {
         //应用算法
         Table[] transform = apr.transform(tmpTable);
         DataStream<Row> rowDataStream = tableEnv.toDataStream(transform[0]);
-        //收集结果
+        // 收集结果
         List<Row> results = IteratorUtils.toList(rowDataStream.executeAndCollect());
         //根据第一项进行排序
         results.sort((o1, o2) -> {
@@ -58,7 +59,6 @@ public class AprioriExample {
             return items1.toString().compareTo(items2.toString());
         });
         Table table = tableEnv.fromDataStream(env.fromCollection(results, TableUtils.getRowTypeInfo(transform[0].getResolvedSchema())));
-
         //创建临时视图
         tableEnv.createTemporaryView("tt", table);
 

@@ -24,7 +24,7 @@ public class FCMExample {
         StreamTableEnvironment tEnv;
         Table dataTable;
         env = StreamExecutionEnvironment.getExecutionEnvironment();
-        env.setParallelism(1);
+        env.setParallelism(3);
 
         tEnv = StreamTableEnvironment.create(env);
         dataTable = tEnv.fromDataStream(env.fromCollection(testData));

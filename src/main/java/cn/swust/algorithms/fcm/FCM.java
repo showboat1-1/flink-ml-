@@ -3,10 +3,7 @@ package cn.swust.algorithms.fcm;
 import org.apache.commons.rng.UniformRandomProvider;
 import org.apache.commons.rng.sampling.distribution.DirichletSampler;
 import org.apache.commons.rng.simple.RandomSource;
-import org.apache.flink.api.common.functions.FlatMapFunction;
-import org.apache.flink.api.common.functions.MapFunction;
-import org.apache.flink.api.common.functions.ReduceFunction;
-import org.apache.flink.api.common.functions.RichMapFunction;
+import org.apache.flink.api.common.functions.*;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
@@ -21,11 +18,9 @@ import org.apache.flink.iteration.*;
 import org.apache.flink.iteration.datacache.nonkeyed.ListStateWithCache;
 import org.apache.flink.iteration.operator.OperatorStateUtils;
 import org.apache.flink.ml.api.Estimator;
-import org.apache.flink.ml.clustering.kmeans.KMeans;
 import org.apache.flink.ml.common.broadcast.BroadcastUtils;
 import org.apache.flink.ml.common.distance.DistanceMeasure;
 import org.apache.flink.ml.common.iteration.ForwardInputsOfLastRound;
-import org.apache.flink.ml.common.iteration.TerminateOnMaxIter;
 import org.apache.flink.ml.linalg.BLAS;
 import org.apache.flink.ml.linalg.DenseVector;
 import org.apache.flink.ml.linalg.Vector;
@@ -40,6 +35,7 @@ import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.api.operators.TwoInputStreamOperator;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.table.api.Table;
@@ -267,6 +263,9 @@ public class FCM implements Estimator<FCM,FCMModel>,FCMParams<FCM> {
 //                return r;
 //            },ObjectArrayTypeInfo.getInfoFor(DenseVectorTypeInfo.INSTANCE));
 
+            //此处使用双流操作，是因为尝试了多种单流操作都无法实现在每一轮的过程中 根据新计算的最大差值进行判断，会报空指针异常，因此使用双流操作
+            //推测原因是，该迭代采用全轮迭代的设置，在每一轮不会新建算子，导致后续计算出的maxTolData没有数据流经
+            //经测试发现方案可行
             SingleOutputStreamOperator<Integer> terminationCriteriaUDF = pointsAndMembership
                     .connect(maxTolData.broadcast())
                     .transform(
@@ -289,7 +288,7 @@ public class FCM implements Estimator<FCM,FCMModel>,FCMParams<FCM> {
     public static class TerminationCriteriaUDF  extends AbstractStreamOperator<Integer>
             implements  TwoInputStreamOperator<
             Tuple2<DenseVector,DenseVector>, Double, Integer>
-            ,IterationListener<Integer>{
+            ,IterationListener<Integer> {
 
         private final double tolerance;
         private final Integer maxIter;
@@ -313,6 +312,7 @@ public class FCM implements Estimator<FCM,FCMModel>,FCMParams<FCM> {
                     Objects.requireNonNull(
                             OperatorStateUtils.getUniqueElement(maxTol, "maxTol")
                                     .orElse(null));
+            //由于第一轮并没有计算出最大差值，默认给的-1，所以需要跳过第一轮的判断,避免循环停止
             if (i < 1){
                 collector.collect(0);
             }else{
@@ -507,7 +507,9 @@ public class FCM implements Estimator<FCM,FCMModel>,FCMParams<FCM> {
         public void onIterationTerminated(
                 Context context,
                 Collector<Tuple3<Double[], DenseVector[],Double>> collector) throws Exception {
-
+            centroids.clear();
+            pointsAndMembership.clear();
+            tmp2.clear();
         }
 
         @Override

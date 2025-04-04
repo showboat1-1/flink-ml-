@@ -1,6 +1,6 @@
 package cn.swust.algorithms.topsis;
 
-import org.apache.flink.api.common.functions.FlatMapFunction;
+
 import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.common.functions.RichMapFunction;
 import org.apache.flink.api.common.state.ListState;
@@ -9,12 +9,10 @@ import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.tuple.Tuple3;
-import org.apache.flink.api.java.typeutils.RowTypeInfo;
 import org.apache.flink.iteration.operator.OperatorStateUtils;
-import org.apache.flink.ml.api.AlgoOperator;
+import org.apache.flink.ml.api.Estimator;
 import org.apache.flink.ml.common.broadcast.BroadcastUtils;
 import org.apache.flink.ml.common.datastream.DataStreamUtils;
-import org.apache.flink.ml.common.datastream.TableUtils;
 import org.apache.flink.ml.common.window.Windows;
 import org.apache.flink.ml.linalg.BLAS;
 import org.apache.flink.ml.linalg.DenseVector;
@@ -22,31 +20,32 @@ import org.apache.flink.ml.linalg.Vector;
 import org.apache.flink.ml.param.Param;
 import org.apache.flink.ml.util.ParamUtils;
 import org.apache.flink.ml.util.ReadWriteUtils;
+
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
+import org.apache.flink.streaming.api.functions.windowing.ProcessAllWindowFunction;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.streaming.api.windowing.windows.Window;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.table.api.Table;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.table.api.internal.TableImpl;
 import org.apache.flink.types.Row;
+import org.apache.flink.util.Collector;
 import org.apache.flink.util.Preconditions;
 
 import java.io.IOException;
 import java.util.*;
 
-/**
- * 实现 TOPSIS（优先级评估法）的算法。
- */
-public class Topsis implements AlgoOperator<Topsis>, TopsisParams<Topsis> {
-
+public class OnlineTopsis implements Estimator<OnlineTopsis,OnlineTopsisModel>,
+        OnlineTopsisParams<OnlineTopsis> {
     private final Map<Param<?>, Object> paramMap = new HashMap<>();
 
-    public Topsis() {
+    public OnlineTopsis() {
         ParamUtils.initializeMapWithDefaultValues(paramMap, this);
     }
     //标准类型常量
@@ -56,29 +55,120 @@ public class Topsis implements AlgoOperator<Topsis>, TopsisParams<Topsis> {
     private static final Integer INTERVAL = 4;
 
     @Override
-    public Table[] transform(Table... inputs) {
+    public OnlineTopsisModel fit(Table... inputs) {
         Preconditions.checkArgument(inputs.length == 1);
-        StreamTableEnvironment tEnv =
-                (StreamTableEnvironment) ((TableImpl) inputs[0]).getTableEnvironment();
         //检查标准类型
         checkCriteriaTypes(getCriteriaTypes());
 
-        SingleOutputStreamOperator<DenseVector> inputDataStream =
-                tEnv
-                        .toDataStream(inputs[0])
-                        .map(row -> ((Vector) row.getField(getFeaturesCol())).toDense());
+        StreamTableEnvironment tEnv =
+                (StreamTableEnvironment) ((TableImpl) inputs[0]).getTableEnvironment();
 
-        //1.将原始矩阵正向化，就是要将所有的指标类型统一转化为极大型指标
-        //1.1 先对中间型 计算Xi-Xbest
-        SingleOutputStreamOperator<DenseVector> dealData1 = inputDataStream.map(r -> {
-            Integer[] criteriaTypes = getCriteriaTypes();
-            for (int i = 0; i < criteriaTypes.length; i++) {
-                if (Objects.equals(criteriaTypes[i], INTERMEDIATE)) {
-                    r.set(i, Math.abs(r.get(i) - getBestValue()));
+        //获取窗口处理策略
+        Windows windows = getWindows();
+
+        //进行窗口聚合，计算均值
+        SingleOutputStreamOperator<TopsisModelData> modelData = DataStreamUtils.windowAllAndProcess(
+                tEnv.toDataStream(inputs[0]),
+                windows,
+                new ComputeAvgDataFunction<>(getFeaturesCol()));
+
+        //应用topsis算法
+        SingleOutputStreamOperator<DenseVector> tData =modelData.map(r->r.data);
+        //f0:原始数据 f1:得分
+        DataStream<Tuple2<DenseVector, DenseVector>> topsisData = applyTopsis(tData);
+//        topsisData.print();
+
+        //更新模型数据
+        final String broadcastModelKey = "broadcastModelKey";
+        DataStream<TopsisModelData> newModelData = BroadcastUtils.withBroadcastStream(
+                Collections.singletonList(topsisData),
+                Collections.singletonMap(broadcastModelKey, modelData),
+                inputList -> {
+                    DataStream inputData = inputList.get(0);
+                    return inputData.map(
+                            new UpdateModelData(broadcastModelKey),
+                            TypeInformation.of(TopsisModelData.class));
+                });
+
+        OnlineTopsisModel model =
+                new OnlineTopsisModel().setModelData(tEnv.fromDataStream(newModelData));
+
+        ParamUtils.updateExistingParams(model, paramMap);
+        return model;
+    }
+
+    private static class UpdateModelData extends RichMapFunction<Tuple2<DenseVector, DenseVector>, TopsisModelData>{
+        private final String broadcastModelKey;
+        List<TopsisModelData> modelDataList;
+
+        private UpdateModelData(String broadcastModelKey) {
+            this.broadcastModelKey = broadcastModelKey;
+        }
+
+        @Override
+        public TopsisModelData map(Tuple2<DenseVector, DenseVector> value) throws Exception {
+            if (modelDataList == null) {
+                modelDataList = getRuntimeContext().getBroadcastVariable(broadcastModelKey);
+            }
+            TopsisModelData model = null;
+            for (TopsisModelData topsisModelData : modelDataList) {
+                if (Objects.hashCode(value.f0) == Objects.hashCode(topsisModelData.data)) {
+                    model = new TopsisModelData(topsisModelData.data,topsisModelData.timestamp,value.f1.get(0),topsisModelData.minTimestamp);
+                    break;
                 }
             }
-            return r;
-        }, TypeInformation.of(DenseVector.class));
+            return model;
+        }
+    }
+
+
+
+    //计算每一个窗口中每一列的均值
+    private static class ComputeAvgDataFunction<W extends Window>
+            extends ProcessAllWindowFunction<Row, TopsisModelData, W> {
+
+        private final String featuresCol;
+
+        //计算窗口内的均值
+        private ComputeAvgDataFunction(String featuresCol) {
+            this.featuresCol = featuresCol;
+        }
+
+        @Override
+        public void process(
+                ProcessAllWindowFunction<Row, TopsisModelData, W>.Context context,
+                Iterable<Row> elements,
+                Collector<TopsisModelData> out) throws Exception {
+            DenseVector sum = null;
+            long count = 0;
+            //记录窗口中最小的时间戳
+            long minTimestamp = Long.MAX_VALUE;
+            for (Row element : elements) {
+                Long timeStamp = (Long) Objects.requireNonNull(element.getField("id"));
+                minTimestamp = Math.min(timeStamp,minTimestamp);
+                Vector inputVec =
+                        ((Vector) Objects.requireNonNull(element.getField(featuresCol))).clone();
+                if (sum == null){
+                    sum = new DenseVector(inputVec.size());
+                }
+                /** y += a * x . */
+                BLAS.axpy(1, inputVec, sum);
+                count++;
+            }
+            DenseVector avg = new DenseVector(sum.size());
+            BLAS.axpy(1.0/count, sum, avg);
+            //获取窗口中最大时间戳
+            long timestamp = context.window().maxTimestamp();
+            out.collect(new TopsisModelData(avg,timestamp,minTimestamp));
+        }
+    }
+    private DataStream<Tuple2<DenseVector,DenseVector>> applyTopsis(DataStream<DenseVector> inputDataStream){
+        //1.将原始矩阵正向化，就是要将所有的指标类型统一转化为极大型指标
+        //1.1 先对中间型 计算Xi-Xbest
+        SingleOutputStreamOperator<DenseVector> dealData1 =
+                inputDataStream.map(
+                        new MapUDF1(getCriteriaTypes(),getBestValue()),
+                        TypeInformation.of(DenseVector.class));
 //        dealData1.print();
 
         //1.2单独处理区间类型指标 Tuple3 : f0:索引 f1:min f2:max
@@ -113,25 +203,7 @@ public class Topsis implements AlgoOperator<Topsis>, TopsisParams<Topsis> {
 //        dealData2final.print();
 
         //1.3 同时对极小型和中间型进行处理
-        DataStream<DenseVector> dealData1final = DataStreamUtils.reduce(dealData1, new ReduceFunction<DenseVector>() {
-            @Override
-            public DenseVector reduce(DenseVector value1, DenseVector value2) throws Exception {
-                DenseVector dv = new DenseVector(value1.size());
-                Integer[] criteriaTypes = getCriteriaTypes();
-                for (int i = 0; i < criteriaTypes.length; i++) {
-                    if (Objects.equals(criteriaTypes[i], EXTREMELY_LARGE)) {
-                        dv.set(i, -1);
-                    } else if (Objects.equals(criteriaTypes[i], EXTREMELY_SMALL)) {
-                        dv.set(i, Math.max(value1.get(i), value2.get(i)));
-                    } else if (Objects.equals(criteriaTypes[i], INTERMEDIATE)) {
-                        dv.set(i, Math.max(value1.get(i), value2.get(i)));
-                    } else {
-                        dv.set(i, -1);
-                    }
-                }
-                return dv;
-            }
-        });
+        DataStream<DenseVector> dealData1final = DataStreamUtils.reduce(dealData1, new ReduceUDF1(getCriteriaTypes()));
 //        dealData1final.print();
 
         //1.4 将处理的结果广播出去，计算最终结果
@@ -174,12 +246,12 @@ public class Topsis implements AlgoOperator<Topsis>, TopsisParams<Topsis> {
         //2.2 计算每一行的平方和
         DataStream<DenseVector> middleDealData2 = DataStreamUtils.reduce(middleDealData1,
                 (ReduceFunction<DenseVector>) (value1, value2) -> {
-            DenseVector dv = new DenseVector(value1.size());
-            for (int i = 0; i < value1.size(); i++) {
-                dv.set(i, value1.get(i) + value2.get(i));
-            }
-            return dv;
-        });
+                    DenseVector dv = new DenseVector(value1.size());
+                    for (int i = 0; i < value1.size(); i++) {
+                        dv.set(i, value1.get(i) + value2.get(i));
+                    }
+                    return dv;
+                });
 //        middleDealData2.print();
 
         //2.3 标准化
@@ -202,12 +274,12 @@ public class Topsis implements AlgoOperator<Topsis>, TopsisParams<Topsis> {
         SingleOutputStreamOperator<DenseVector> thirdDealData = middleDealDataFinal.map(r -> r.f1, TypeInformation.of(DenseVector.class));
         DataStream<DenseVector> thirdDealMaxData = DataStreamUtils.reduce(thirdDealData,
                 (ReduceFunction<DenseVector>) (value1, value2) -> {
-            DenseVector dv = new DenseVector(value1.size());
-            for (int i = 0; i < value1.size(); i++) {
-                dv.set(i, Math.max(value1.get(i), value2.get(i)));
-            }
-            return dv;
-        });
+                    DenseVector dv = new DenseVector(value1.size());
+                    for (int i = 0; i < value1.size(); i++) {
+                        dv.set(i, Math.max(value1.get(i), value2.get(i)));
+                    }
+                    return dv;
+                });
 //        thirdDealMaxData.print();
         //3.2计算每一列的最小值
         DataStream<DenseVector> thirdDealMinData = DataStreamUtils.reduce(thirdDealData,
@@ -241,24 +313,55 @@ public class Topsis implements AlgoOperator<Topsis>, TopsisParams<Topsis> {
                                     TypeInformation.of(DenseVector.class),
                                     TypeInformation.of(DenseVector.class)));
                 });
-//        thirdDealDataFinal.print();
-
-        return new Table[]{convert2Table(tEnv, thirdDealDataFinal)};
+        return thirdDealDataFinal;
     }
 
+    private static class MapUDF1 extends RichMapFunction<DenseVector, DenseVector> {
+        private final Integer[] criteriaTypes;
+        private final Double bestValue;
 
+        private MapUDF1(Integer[] criteriaTypes, Double bestValue) {
+            this.criteriaTypes = criteriaTypes;
+            this.bestValue = bestValue;
+        }
 
-    private Table convert2Table(StreamTableEnvironment tEnv,DataStream<Tuple2<DenseVector,DenseVector>> dataStream){
-        //构建返回表
-        TypeInformation[] types = new TypeInformation[]{TypeInformation.of(DenseVector.class), TypeInformation.of(DenseVector.class)};
-        String[] names = new String[]{getFeaturesCol(),getPredictionCol()};
-        RowTypeInfo rowTypeInfo = new RowTypeInfo(types, names);
-
-        SingleOutputStreamOperator<Row> rowData = dataStream.map(r -> Row.of(r.f0, r.f1), rowTypeInfo);
-        return tEnv.fromDataStream(rowData);
+        @Override
+        public DenseVector map(DenseVector r) throws Exception {
+            for (int i = 0; i < criteriaTypes.length; i++) {
+                if (Objects.equals(criteriaTypes[i], INTERMEDIATE)) {
+                    r.set(i, Math.abs(r.get(i) - bestValue));
+                }
+            }
+            return r;
+        }
     }
 
-    private static class CalScore extends RichMapFunction<Tuple2<DenseVector,DenseVector>, Tuple2<DenseVector,DenseVector>>{
+    private static class ReduceUDF1 implements ReduceFunction<DenseVector> {
+        private final Integer[] criteriaTypes;
+
+        private ReduceUDF1(Integer[] criteriaTypes) {
+            this.criteriaTypes = criteriaTypes;
+        }
+
+        @Override
+        public DenseVector reduce(DenseVector value1, DenseVector value2) throws Exception {
+            DenseVector dv = new DenseVector(value1.size());
+            for (int i = 0; i < criteriaTypes.length; i++) {
+                if (Objects.equals(criteriaTypes[i], EXTREMELY_LARGE)) {
+                    dv.set(i, -1);
+                } else if (Objects.equals(criteriaTypes[i], EXTREMELY_SMALL)) {
+                    dv.set(i, Math.max(value1.get(i), value2.get(i)));
+                } else if (Objects.equals(criteriaTypes[i], INTERMEDIATE)) {
+                    dv.set(i, Math.max(value1.get(i), value2.get(i)));
+                } else {
+                    dv.set(i, -1);
+                }
+            }
+            return dv;
+        }
+    }
+
+    private static class CalScore extends RichMapFunction<Tuple2<DenseVector,DenseVector>, Tuple2<DenseVector,DenseVector>> {
         private final String bcThirdDealMaxData;
         private final String bcThirdDealMinData;
 
@@ -448,7 +551,9 @@ public class Topsis implements AlgoOperator<Topsis>, TopsisParams<Topsis> {
         }
     }
 
+
     private void checkCriteriaTypes(Integer[] criteriaTypes) {
+        //遍历给定的标准类型
         for (Integer criteriaType : criteriaTypes) {
             if(criteriaType == INTERMEDIATE){
                 //中间型,检查最优值是否为空
@@ -465,16 +570,16 @@ public class Topsis implements AlgoOperator<Topsis>, TopsisParams<Topsis> {
     }
 
     @Override
-    public Map<Param<?>, Object> getParamMap() {
-        return paramMap;
-    }
-
-    @Override
     public void save(String path) throws IOException {
         ReadWriteUtils.saveMetadata(this, path);
     }
 
-    public static Topsis load(StreamTableEnvironment env, String path) throws IOException {
+    public static OnlineTopsis load(StreamTableEnvironment tEnv, String path) throws IOException {
         return ReadWriteUtils.loadStageParam(path);
+    }
+
+    @Override
+    public Map<Param<?>, Object> getParamMap() {
+        return paramMap;
     }
 }
